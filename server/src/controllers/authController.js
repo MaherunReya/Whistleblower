@@ -92,7 +92,7 @@ export async function login(req, res) {
       role: user.role,
     });
     setSessionCookie(res, sessionToken);
-    res.json({ id: user._id, username: user.username, role: user.role });
+    res.json({ id: user._id, username: user.username, role: user.role, is2FAEnabled: user.is2FAEnabled });
   } catch (err) {
     res.status(500).json({ error: "Login failed", details: err.message });
   }
@@ -128,7 +128,7 @@ export async function verify2FA(req, res) {
       role: user.role,
     });
     setSessionCookie(res, sessionToken);
-    res.json({ id: user._id, username: user.username, role: user.role });
+    res.json({ id: user._id, username: user.username, role: user.role, is2FAEnabled: user.is2FAEnabled });
   } catch (err) {
     res.status(500).json({ error: "2FA verification failed", details: err.message });
   }
