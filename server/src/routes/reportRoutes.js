@@ -5,6 +5,7 @@ import {
   getReportByTrackingId,
   getAssignedReports,
   updateReportStatus,
+  reassignReport,
 } from "../controllers/reportController.js";
 
 const router = Router();
@@ -16,5 +17,8 @@ router.get("/track/:trackingId", getReportByTrackingId);
 // Reviewer-only
 router.get("/assigned", requireAuth, requireRole("reviewer"), getAssignedReports);
 router.patch("/:id/status", requireAuth, requireRole("reviewer"), updateReportStatus);
+
+// Admin-only
+router.patch("/:id/assign", requireAuth, requireRole("admin"), reassignReport);
 
 export default router;

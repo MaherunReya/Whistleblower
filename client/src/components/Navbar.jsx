@@ -28,8 +28,10 @@ export default function Navbar() {
           {!user && <Link to="/register">Register</Link>}
           {user?.role === "reviewer" && <Link to="/reviewer">Reviewer Dashboard</Link>}
           {user?.role === "admin" && <Link to="/admin">Admin Dashboard</Link>}
+          {user?.role === "admin" && <Link to="/profile">My Profile</Link>}
           {user && (
             <>
+              <Link to="/change-password">Change Password</Link>
               <span className="navbar-user">
                 {user.username} · {user.role}
               </span>

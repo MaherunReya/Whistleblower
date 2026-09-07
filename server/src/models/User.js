@@ -10,6 +10,9 @@ const userSchema = new mongoose.Schema(
 
     passwordHash: { type: String, required: true },
     passwordSalt: { type: String, required: true },
+    // Set true when an admin creates this account (they know the initial
+    // password), cleared once the user sets their own via /auth/password.
+    mustChangePassword: { type: Boolean, default: false },
 
     role: { type: String, enum: ["reporter", "reviewer", "admin"], default: "reporter" },
 

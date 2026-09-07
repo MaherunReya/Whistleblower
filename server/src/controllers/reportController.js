@@ -14,6 +14,7 @@ import * as ecc from "../crypto/ecc.js";
 import { computeMAC, verifyMAC, appendChainedEntry } from "../crypto/mac.js";
 import { generateTrackingId } from "../utils/trackingId.js";
 import { getPublicKeysWithVersion, getPrivateKeysForDecryption } from "../crypto/keyManager.js";
+import { logAudit } from "./adminController.js";
 
 const GENESIS_MAC = "GENESIS";
 const STATUSES = ["Open", "Investigating", "Resolved"];
@@ -268,5 +269,93 @@ export async function updateReportStatus(req, res) {
     res.json({ id: report._id, status: report.status, statusLog: report.statusLog });
   } catch (err) {
     res.status(500).json({ error: "Failed to update report status", details: err.message });
+  }
+}
+
+/**
+ * Admin-only reassignment. Decrypts under the OLD reviewer's private key
+ * and re-encrypts under the NEW reviewer's public key, entirely server-side
+ * — the plaintext is never included in this endpoint's response, so the
+ * admin triggering a reassignment still never gets to read report content.
+ */
+export async function reassignReport(req, res) {
+  try {
+    const { id } = req.params;
+    const { reviewerId } = req.body;
+    if (!reviewerId) return res.status(400).json({ error: "reviewerId is required" });
+
+    const report = await Report.findById(id);
+    if (!report) return res.status(404).json({ error: "Report not found" });
+
+    const newReviewer = await User.findOne({ _id: reviewerId, role: "reviewer" });
+    if (!newReviewer) return res.status(400).json({ error: "reviewerId is not a valid reviewer" });
+
+    if (String(report.assignedReviewer) === String(reviewerId)) {
+      return res.status(400).json({ error: "Report is already assigned to this reviewer" });
+    }
+
+    const macValid = verifyMAC(
+      macPayload({
+        trackingId: report.trackingId,
+        titleEncrypted: report.titleEncrypted,
+        descriptionEncrypted: report.descriptionEncrypted,
+        categoryEncrypted: report.categoryEncrypted,
+        evidenceEncrypted: report.evidenceEncrypted,
+        reporterIdentityEncrypted: report.reporterIdentityEncrypted,
+      }),
+      getReportMacSecret(),
+      report.mac
+    );
+    if (!macValid) {
+      return res.status(409).json({ error: "Cannot reassign — report failed integrity verification" });
+    }
+
+    const { rsaPrivateKey: oldRsaPriv, eccPrivateKey: oldEccPriv } = await getPrivateKeysForDecryption(
+      report.assignedReviewer,
+      report.reviewerKeyVersion
+    );
+
+    const title = rsa.decrypt(report.titleEncrypted, oldRsaPriv);
+    const description = rsa.decrypt(report.descriptionEncrypted, oldRsaPriv);
+    const category = report.categoryEncrypted ? rsa.decrypt(report.categoryEncrypted, oldRsaPriv) : null;
+    const evidence = report.evidenceEncrypted ? rsa.decrypt(report.evidenceEncrypted, oldRsaPriv) : null;
+    const identity = report.reporterIdentityEncrypted
+      ? ecc.decrypt(report.reporterIdentityEncrypted, oldEccPriv)
+      : null;
+
+    const newKeys = await getPublicKeysWithVersion(reviewerId);
+    if (!newKeys) return res.status(503).json({ error: "New reviewer has no active encryption keys" });
+
+    report.titleEncrypted = rsa.encrypt(title, newKeys.rsaPublicKey);
+    report.descriptionEncrypted = rsa.encrypt(description, newKeys.rsaPublicKey);
+    report.categoryEncrypted = category ? rsa.encrypt(category, newKeys.rsaPublicKey) : undefined;
+    report.evidenceEncrypted = evidence ? rsa.encrypt(evidence, newKeys.rsaPublicKey) : undefined;
+    report.reporterIdentityEncrypted = identity ? ecc.encrypt(identity, newKeys.eccPublicKey) : null;
+    report.reviewerKeyVersion = newKeys.version;
+
+    report.mac = computeMAC(
+      macPayload({
+        trackingId: report.trackingId,
+        titleEncrypted: report.titleEncrypted,
+        descriptionEncrypted: report.descriptionEncrypted,
+        categoryEncrypted: report.categoryEncrypted,
+        evidenceEncrypted: report.evidenceEncrypted,
+        reporterIdentityEncrypted: report.reporterIdentityEncrypted,
+      }),
+      getReportMacSecret()
+    );
+
+    const previousReviewer = report.assignedReviewer;
+    report.assignedReviewer = reviewerId;
+    await report.save();
+
+    await logAudit("REPORT_REASSIGNED", req.user.sub, report._id, {
+      from: String(previousReviewer),
+      to: String(reviewerId),
+    });
+
+    res.json({ id: report._id, trackingId: report.trackingId, assignedReviewer: reviewerId });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to reassign report", details: err.message });
   }
 }

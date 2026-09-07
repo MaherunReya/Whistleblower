@@ -6,6 +6,7 @@
  */
 import User from "../models/User.js";
 import AuditLog from "../models/AuditLog.js";
+import Report from "../models/Report.js";
 import { hashPassword } from "../crypto/hash.js";
 import { encryptPlatformField, provisionKeysForReviewer, rotateKeys } from "../crypto/keyManager.js";
 import { appendChainedEntry } from "../crypto/mac.js";
@@ -24,7 +25,9 @@ function getAuditMacSecret() {
  *  Report.statusLog: each entry's MAC covers the previous entry's MAC plus
  *  its own contents, so no entry can be edited, deleted, or reordered
  *  afterward without breaking the chain from that point on. */
-async function logAudit(action, performedBy, targetId, details) {
+/** Appends one MAC-chained audit entry — exported so other controllers
+ *  (e.g. report reassignment) can log into the same tamper-evident chain. */
+export async function logAudit(action, performedBy, targetId, details) {
   const last = await AuditLog.findOne().sort({ timestamp: -1 });
   const previousMac = last ? last.mac : GENESIS_MAC;
 
@@ -65,6 +68,9 @@ export async function createReviewer(req, res) {
       emailEncrypted,
       contactInfoEncrypted,
       role: "reviewer",
+      // Admin knows this initial password, so force the reviewer to set
+      // their own on first login.
+      mustChangePassword: true,
     });
 
     // Every reviewer needs their own RSA + ECC keypair before any report
@@ -76,6 +82,31 @@ export async function createReviewer(req, res) {
     res.status(201).json({ id: user._id, username: user.username, role: user.role });
   } catch (err) {
     res.status(500).json({ error: "Failed to create reviewer", details: err.message });
+  }
+}
+
+/** So the admin doesn't have to know a reviewer's Mongo _id by heart —
+ *  needed both for the "rotate keys" form and for report reassignment. */
+export async function listReviewers(req, res) {
+  try {
+    const reviewers = await User.find({ role: "reviewer" }).select("username createdAt").sort({ username: 1 });
+
+    const counts = await Report.aggregate([
+      { $match: { status: { $in: ["Open", "Investigating"] } } },
+      { $group: { _id: "$assignedReviewer", count: { $sum: 1 } } },
+    ]);
+    const countMap = new Map(counts.map((c) => [String(c._id), c.count]));
+
+    res.json(
+      reviewers.map((r) => ({
+        id: r._id,
+        username: r.username,
+        createdAt: r.createdAt,
+        openReportCount: countMap.get(String(r._id)) ?? 0,
+      }))
+    );
+  } catch (err) {
+    res.status(500).json({ error: "Failed to list reviewers", details: err.message });
   }
 }
 
@@ -126,7 +157,7 @@ export async function getAuditLogs(req, res) {
         chainIntact = false;
         brokenAt = log._id;
       }
-      previousMac = log.mac;
+      previousMac = log.mac; // keep walking so every entry gets checked, not just the first break
 
       return { ...log.toObject(), macValid };
     });

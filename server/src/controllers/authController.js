@@ -6,7 +6,7 @@
  */
 import { authenticator } from "otplib";
 import { hashPassword, verifyPassword } from "../crypto/hash.js";
-import { encryptPlatformField } from "../crypto/keyManager.js";
+import { encryptPlatformField, decryptPlatformField } from "../crypto/keyManager.js";
 import { createSessionToken } from "../middleware/auth.js";
 import { computeMAC, verifyMAC } from "../crypto/mac.js";
 import User from "../models/User.js";
@@ -92,7 +92,13 @@ export async function login(req, res) {
       role: user.role,
     });
     setSessionCookie(res, sessionToken);
-    res.json({ id: user._id, username: user.username, role: user.role, is2FAEnabled: user.is2FAEnabled });
+    res.json({
+      id: user._id,
+      username: user.username,
+      role: user.role,
+      is2FAEnabled: user.is2FAEnabled,
+      mustChangePassword: user.mustChangePassword,
+    });
   } catch (err) {
     res.status(500).json({ error: "Login failed", details: err.message });
   }
@@ -128,7 +134,13 @@ export async function verify2FA(req, res) {
       role: user.role,
     });
     setSessionCookie(res, sessionToken);
-    res.json({ id: user._id, username: user.username, role: user.role, is2FAEnabled: user.is2FAEnabled });
+    res.json({
+      id: user._id,
+      username: user.username,
+      role: user.role,
+      is2FAEnabled: user.is2FAEnabled,
+      mustChangePassword: user.mustChangePassword,
+    });
   } catch (err) {
     res.status(500).json({ error: "2FA verification failed", details: err.message });
   }
@@ -189,15 +201,97 @@ export async function confirm2FA(req, res) {
  *  mount to find out who's logged in (if anyone) without re-submitting credentials. */
 export async function getMe(req, res) {
   try {
-    const user = await User.findById(req.user.sub).select("username role is2FAEnabled");
+    const user = await User.findById(req.user.sub).select("username role is2FAEnabled mustChangePassword");
     if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ id: user._id, username: user.username, role: user.role, is2FAEnabled: user.is2FAEnabled });
+    res.json({
+      id: user._id,
+      username: user.username,
+      role: user.role,
+      is2FAEnabled: user.is2FAEnabled,
+      mustChangePassword: user.mustChangePassword,
+    });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch current user", details: err.message });
+  }
+}
+
+/**
+ * Self-service password change. Requires the current password (proves it's
+ * really the account owner, not just whoever has a live session) plus a new
+ * one. Also clears mustChangePassword, since an admin-set initial password
+ * has now been replaced by one only the user knows.
+ */
+export async function changePassword(req, res) {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: "currentPassword and newPassword are required" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "newPassword must be at least 8 characters" });
+    }
+
+    const user = await User.findById(req.user.sub);
+    if (!user || !verifyPassword(currentPassword, user.passwordSalt, user.passwordHash)) {
+      return res.status(401).json({ error: "Current password is incorrect" });
+    }
+
+    const { hash, salt } = hashPassword(newPassword);
+    user.passwordHash = hash;
+    user.passwordSalt = salt;
+    user.mustChangePassword = false;
+    await user.save();
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to change password", details: err.message });
   }
 }
 
 export async function logout(req, res) {
   res.clearCookie("session");
   res.json({ ok: true });
+}
+
+/**
+ * Admin-only profile view: decrypts the admin's own email/contact info.
+ * Scoped to req.user.sub (the logged-in admin) — this is not a lookup of
+ * an arbitrary user, so it can't be used to read another account's PII.
+ */
+export async function getProfile(req, res) {
+  try {
+    const user = await User.findById(req.user.sub).select("username role emailEncrypted contactInfoEncrypted");
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const email = await decryptPlatformField(user.emailEncrypted);
+    const contactInfo = await decryptPlatformField(user.contactInfoEncrypted);
+
+    res.json({ id: user._id, username: user.username, role: user.role, email, contactInfo });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch profile", details: err.message });
+  }
+}
+
+/**
+ * Admin-only profile update: re-encrypts email/contact info before storing.
+ * Username and password are intentionally not editable here.
+ */
+export async function updateProfile(req, res) {
+  try {
+    const { email, contactInfo } = req.body;
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const emailEncrypted = await encryptPlatformField(email);
+    const contactInfoEncrypted = await encryptPlatformField(contactInfo ?? null);
+
+    const user = await User.findByIdAndUpdate(
+      req.user.sub,
+      { emailEncrypted, contactInfoEncrypted },
+      { new: true }
+    ).select("username role");
+
+    res.json({ id: user._id, username: user.username, role: user.role, email, contactInfo });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update profile", details: err.message });
+  }
 }
